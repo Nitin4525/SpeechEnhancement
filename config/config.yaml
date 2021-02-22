@@ -23,6 +23,7 @@ hparas:
   num_workers: 8
   checkpoint: 'model save name'
   save_path: 'model save path'
+  logs: 'logs save path'
 
 test:
   model_path: 'model read path'
