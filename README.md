@@ -4,7 +4,7 @@
 Code of paper  
 "Combining Weighted Multi-resolution STFT Loss and Distance Fusion to Optimize Speech Enhancement Generative Adversarial Networks"
 
-#### 其他参数
+#### Paras
 corpus: DEMAND  
 sample_rate: 16000  
 window_size: 16384  
