@@ -37,7 +37,6 @@ def emphasis(signal_batch, emph_coeff=0.95, pre=True):
 class AudioDataset(data.Dataset):
     """
     Audio sample reader.
-    References from https://github.com/leftthomas/SEGAN/blob/master/utils.py
     """
 
     def __init__(self, cfg):
@@ -54,6 +53,8 @@ class AudioDataset(data.Dataset):
         """
         Randomly selects a reference batch from dataset.
         Reference batch is used for calculating statistics for virtual batch normalization operation.
+
+        从数据集中随机选择一个引用批。用于计算虚拟批规范化操作的统计信息。
 
         Args:
             batch_size(int): batch size
@@ -83,12 +84,3 @@ class AudioDataset(data.Dataset):
 
     def __len__(self):
         return len(self.file_names)
-
-
-if __name__ == '__main__':
-    import yaml
-    cfg_path = r'config/config.yaml'
-    cfg = yaml.load(open(cfg_path, 'r'), Loader=yaml.FullLoader)
-    dataset = AudioDataset(cfg=cfg['data'])
-    data = dataset.__getitem__(10)
-    pass

@@ -1,6 +1,0 @@
-numpy>=1.19.2
-PyYAML>=5.1.1
-librosa>=0.8.0
-tqdm>=4.50.2
-pytorch>=1.4.0
-scipy>=1.5.4

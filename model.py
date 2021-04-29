@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-
+from torch.nn.modules import Module
 from torch.nn.parameter import Parameter
 
 
-class VirtualBatchNorm1d(nn.Module):
+class VirtualBatchNorm1d(Module):
     """
-    References https://discuss.pytorch.org/t/parameter-grad-of-conv-weight-is-none-after-virtual-batch-normalization/9036
+    Module for Virtual Batch Normalization.
+    Implementation borrowed and modified from Rafael_Valle's code + help of SimonW from this discussion thread:
+    https://discuss.pytorch.org/t/parameter-grad-of-conv-weight-is-none-after-virtual-batch-normalization/9036
     """
 
     def __init__(self, num_features, eps=1e-5):
@@ -37,7 +38,6 @@ class VirtualBatchNorm1d(nn.Module):
         Forward pass of virtual batch normalization.
         Virtual batch normalization require two forward passes
         for reference batch and train batch, respectively.
-
         Args:
             x: input tensor
             ref_mean: reference mean tensor over features
@@ -66,12 +66,10 @@ class VirtualBatchNorm1d(nn.Module):
     def normalize(self, x, mean, mean_sq):
         """
         Normalize tensor x given the statistics.
-
         Args:
             x: input tensor
             mean: mean over features
             mean_sq: squared means over features
-
         Result:
             x: normalized batch tensor
         """
@@ -85,7 +83,7 @@ class VirtualBatchNorm1d(nn.Module):
             raise Exception('Squared mean tensor size not equal to number of features : given {}, expected {}'
                             .format(mean_sq.size(1), self.num_features))
 
-        std = torch.sqrt(self.eps + mean_sq - mean ** 2)    # 这个地方减mean**2在BN的资料中没有，但很多例程都是这么干的，这就是VBN相较于BN不同的地方
+        std = torch.sqrt(self.eps + mean_sq - mean ** 2)
         x = x - mean
         x = x / std
         x = x * self.gamma
@@ -97,80 +95,115 @@ class VirtualBatchNorm1d(nn.Module):
                 .format(name=self.__class__.__name__, **self.__dict__))
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channel: int, out_channel: int, kernel_size: list, dropout: float = None, res: bool = False):
-        super(ConvBlock, self).__init__()
-        self.convA = nn.Conv1d(in_channels=in_channel, out_channels=out_channel, kernel_size=kernel_size[0], stride=1, padding=1)
-        self.actA = nn.LeakyReLU()
-        self.convB = nn.Conv1d(in_channels=out_channel, out_channels=out_channel, kernel_size=kernel_size[1], stride=1, padding=1)
-        self.actB = nn.LeakyReLU()
-        self.res = res
+class Shrinkage(nn.Module):
+    def __init__(self, in_channels):
+        super(Shrinkage, self).__init__()
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(nn.Linear(in_channels, in_channels),
+                                nn.BatchNorm1d(in_channels),
+                                nn.LeakyReLU(),
+                                nn.Linear(in_channels, in_channels),
+                                nn.Sigmoid())
 
-        self.dropout = nn.Identity() if dropout is None else nn.Dropout(p=dropout)
-
-    def forward(self, inputs):
-        x = self.convA(inputs)
-        x = self.actA(x)
-        x = self.convB(x)
-        x = self.actB(x)
-        if self.res:
-            return x, self.dropout(x)
-        else:
-            return self.dropout(x)
-
-
-class MergeBlock(nn.Module):
-    def __init__(self, in_channel: int, out_channel: int, kernel_size: list):
-        super(MergeBlock, self).__init__()
-        self.upsample = nn.Upsample(scale_factor=kernel_size[0])
-        self.conv = nn.Conv1d(in_channels=in_channel, out_channels=out_channel, kernel_size=kernel_size[1], padding=1)
-        self.act = nn.LeakyReLU()
-
-    def forward(self, inputs):
-        x = self.upsample(inputs[0])
-        x = self.conv(x)
-        x = self.act(x)
-        merge = torch.cat((x, inputs[1]), dim=1)
-        return merge
+    def forward(self, x):
+        x_raw = x
+        x = torch.abs(x)
+        x_abs = x
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+        average = x
+        x = self.fc(x)
+        x = torch.mul(average, x)
+        x = x.unsqueeze(2)
+        # 软阈值化
+        sub = x_abs - x
+        zeros = sub - sub
+        n_sub = torch.max(sub, zeros)
+        x = torch.mul(torch.sign(x_raw), n_sub)
+        return x
 
 
 class Generator(nn.Module):
-    def __init__(self):
-        super(Generator, self).__init__()
-        self.layer1 = ConvBlock(in_channel=1, out_channel=16, kernel_size=[3, 3], res=True)
-        self.pooling1 = nn.MaxPool1d(kernel_size=2)
-        self.layer2 = ConvBlock(in_channel=16, out_channel=32, kernel_size=[3, 3], res=True)
-        self.pooling2 = nn.MaxPool1d(kernel_size=2)
-        self.layer3 = ConvBlock(in_channel=32, out_channel=64, kernel_size=[3, 3], res=True)
-        self.pooling3 = nn.MaxPool1d(kernel_size=2)
-        self.layer4 = ConvBlock(in_channel=64, out_channel=128, kernel_size=[3, 3], res=True)
-        self.pooling4 = nn.MaxPool1d(kernel_size=2)
-        self.layer5 = ConvBlock(in_channel=128, out_channel=256, kernel_size=[3, 3], res=True)
-        self.pooling5 = nn.MaxPool1d(kernel_size=2)
-        self.layer6 = ConvBlock(in_channel=256, out_channel=512, kernel_size=[3, 3], dropout=0.5, res=True)
-        self.pooling6 = nn.MaxPool1d(kernel_size=2)
+    """G"""
 
-        self.layer7 = ConvBlock(in_channel=512, out_channel=1024, kernel_size=[3, 3], dropout=0.5)
+    def __init__(self, kernel_size: int, Shrink: False):
+        super().__init__()
+        # 使k-2=2p
+        # encoder gets a noisy signal as input [B x 1 x 16384]
+        padding = int((kernel_size - 2) / 2)
+        self.enc1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=kernel_size, stride=2, padding=padding)  # [B x 16 x 8192]
+        self.enc1_nl = nn.PReLU()
+        self.enc2 = nn.Conv1d(16, 32, kernel_size, 2, padding)  # [B x 32 x 4096]
+        self.enc2_nl = nn.PReLU()
+        self.enc3 = nn.Conv1d(32, 32, kernel_size, 2, padding)  # [B x 32 x 2048]
+        self.enc3_nl = nn.PReLU()
+        self.enc4 = nn.Conv1d(32, 64, kernel_size, 2, padding)  # [B x 64 x 1024]
+        self.enc4_nl = nn.PReLU()
+        self.enc5 = nn.Conv1d(64, 64, kernel_size, 2, padding)  # [B x 64 x 512]
+        self.enc5_nl = nn.PReLU()
+        self.enc6 = nn.Conv1d(64, 128, kernel_size, 2, padding)  # [B x 128 x 256]
+        self.enc6_nl = nn.PReLU()
+        self.enc7 = nn.Conv1d(128, 128, kernel_size, 2, padding)  # [B x 128 x 128]
+        self.enc7_nl = nn.PReLU()
+        self.enc8 = nn.Conv1d(128, 256, kernel_size, 2, padding)  # [B x 256 x 64]
+        self.enc8_nl = nn.PReLU()
+        self.enc9 = nn.Conv1d(256, 256, kernel_size, 2, padding)  # [B x 256 x 32]
+        self.enc9_nl = nn.PReLU()
+        self.enc10 = nn.Conv1d(256, 512, kernel_size, 2, padding)  # [B x 512 x 16]
+        self.enc10_nl = nn.PReLU()
+        self.enc11 = nn.Conv1d(512, 1024, kernel_size, 2, padding)  # [B x 1024 x 8]
+        self.enc11_nl = nn.PReLU()
 
-        self.layer8 = nn.Sequential(MergeBlock(in_channel=1024, out_channel=512, kernel_size=[2, 3]),
-                                    ConvBlock(in_channel=1024, out_channel=512, kernel_size=[3, 3]))
-        self.layer9 = nn.Sequential(MergeBlock(in_channel=512, out_channel=256, kernel_size=[2, 3]),
-                                    ConvBlock(in_channel=512, out_channel=256, kernel_size=[3, 3]))
-        self.layer10 = nn.Sequential(MergeBlock(in_channel=256, out_channel=128, kernel_size=[2, 3]),
-                                     ConvBlock(in_channel=256, out_channel=128, kernel_size=[3, 3]))
-        self.layer11 = nn.Sequential(MergeBlock(in_channel=128, out_channel=64, kernel_size=[2, 3]),
-                                     ConvBlock(in_channel=128, out_channel=64, kernel_size=[3, 3]))
-        self.layer12 = nn.Sequential(MergeBlock(in_channel=64, out_channel=32, kernel_size=[2, 3]),
-                                     ConvBlock(in_channel=64, out_channel=32, kernel_size=[3, 3]))
-        self.layer13 = nn.Sequential(MergeBlock(in_channel=32, out_channel=16, kernel_size=[2, 3]),
-                                     nn.Conv1d(in_channels=32, out_channels=16, kernel_size=3, padding=1),
-                                     nn.LeakyReLU(),
-                                     nn.Conv1d(in_channels=16, out_channels=16, kernel_size=3, padding=1),
-                                     nn.LeakyReLU(),
-                                     nn.Conv1d(in_channels=16, out_channels=2, kernel_size=3, padding=1),
-                                     nn.LeakyReLU())
-        self.final = nn.Sequential(nn.Conv1d(in_channels=2, out_channels=1, kernel_size=1),
-                                   nn.Tanh())
+        # decoder generates an enhanced signal
+        # each decoder output are concatenated with homologous encoder output,
+        # so the feature map sizes are doubled
+        self.dec10 = nn.ConvTranspose1d(in_channels=2048, out_channels=512, kernel_size=kernel_size, stride=2, padding=padding)
+        self.dec10_nl = nn.PReLU()  # out : [B x 512 x 16] -> (concat) [B x 1024 x 16]
+        self.dec9 = nn.ConvTranspose1d(1024, 256, kernel_size, 2, padding)  # [B x 256 x 32]
+        self.dec9_nl = nn.PReLU()
+        self.dec8 = nn.ConvTranspose1d(512, 256, kernel_size, 2, padding)  # [B x 256 x 64]
+        self.dec8_nl = nn.PReLU()
+        self.dec7 = nn.ConvTranspose1d(512, 128, kernel_size, 2, padding)  # [B x 128 x 128]
+        self.dec7_nl = nn.PReLU()
+        self.dec6 = nn.ConvTranspose1d(256, 128, kernel_size, 2, padding)  # [B x 128 x 256]
+        self.dec6_nl = nn.PReLU()
+        self.dec5 = nn.ConvTranspose1d(256, 64, kernel_size, 2, padding)  # [B x 64 x 512]
+        self.dec5_nl = nn.PReLU()
+        self.dec4 = nn.ConvTranspose1d(128, 64, kernel_size, 2, padding)  # [B x 64 x 1024]
+        self.dec4_nl = nn.PReLU()
+        self.dec3 = nn.ConvTranspose1d(128, 32, kernel_size, 2, padding)  # [B x 32 x 2048]
+        self.dec3_nl = nn.PReLU()
+        self.dec2 = nn.ConvTranspose1d(64, 32, kernel_size, 2, padding)  # [B x 32 x 4096]
+        self.dec2_nl = nn.PReLU()
+        self.dec1 = nn.ConvTranspose1d(64, 16, kernel_size, 2, padding)  # [B x 16 x 8192]
+        self.dec1_nl = nn.PReLU()
+        self.dec_final = nn.ConvTranspose1d(32, 1, kernel_size, 2, padding)  # [B x 1 x 16384]
+        self.dec_tanh = nn.Tanh()
+
+        if Shrink:
+            self.shrinkage10 = Shrinkage(512)
+            self.shrinkage9 = Shrinkage(256)
+            self.shrinkage8 = Shrinkage(256)
+            self.shrinkage7 = Shrinkage(128)
+            self.shrinkage6 = Shrinkage(128)
+            self.shrinkage5 = Shrinkage(64)
+            self.shrinkage4 = Shrinkage(64)
+            self.shrinkage3 = Shrinkage(32)
+            self.shrinkage2 = Shrinkage(32)
+            self.shrinkage1 = Shrinkage(16)
+        else:
+            self.shrinkage10 = nn.Identity()
+            self.shrinkage9 = nn.Identity()
+            self.shrinkage8 = nn.Identity()
+            self.shrinkage7 = nn.Identity()
+            self.shrinkage6 = nn.Identity()
+            self.shrinkage5 = nn.Identity()
+            self.shrinkage4 = nn.Identity()
+            self.shrinkage3 = nn.Identity()
+            self.shrinkage2 = nn.Identity()
+            self.shrinkage1 = nn.Identity()
+
+        # initialize weights
         self.init_weights()
 
     def init_weights(self):
@@ -178,74 +211,107 @@ class Generator(nn.Module):
         Initialize weights for convolution layers using Xavier initialization.
         """
         for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight)
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.ConvTranspose1d):
+                nn.init.xavier_normal_(m.weight.data)
 
-    def forward(self, x):
-        x1, res1 = self.layer1(x)
-        x2, res2 = self.layer2(self.pooling1(x1))
-        x3, res3 = self.layer3(self.pooling2(x2))
-        x4, res4 = self.layer4(self.pooling3(x3))
-        x5, res5 = self.layer5(self.pooling4(x4))
-        x6, res6 = self.layer6(self.pooling5(x5))
-        x7 = self.layer7(self.pooling6(x6))
-        x8 = self.layer8([x7, res6])
-        x9 = self.layer9([x8, res5])
-        x10 = self.layer10([x9, res4])
-        x11 = self.layer11([x10, res3])
-        x12 = self.layer12([x11, res2])
-        x13 = self.layer13([x12, res1])
-        outputs = self.final(x13)
-        return outputs
+    def forward(self, x, z):
+        """
+        Forward pass of generator.
+        Args:
+            x: input batch (signal)
+            z: latent vector
+        """
+        # encoding step
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.enc1_nl(e1))
+        e3 = self.enc3(self.enc2_nl(e2))
+        e4 = self.enc4(self.enc3_nl(e3))
+        e5 = self.enc5(self.enc4_nl(e4))
+        e6 = self.enc6(self.enc5_nl(e5))
+        e7 = self.enc7(self.enc6_nl(e6))
+        e8 = self.enc8(self.enc7_nl(e7))
+        e9 = self.enc9(self.enc8_nl(e8))
+        e10 = self.enc10(self.enc9_nl(e9))
+        e11 = self.enc11(self.enc10_nl(e10))
+        # c = compressed feature, the 'thought vector'
+        c = self.enc11_nl(e11)
+
+        # concatenate the thought vector with latent variable
+        encoded = torch.cat((c, z), dim=1)
+
+        # decoding step
+        d10 = self.dec10(encoded)
+        # dx_c : concatenated with skip-connected layer's output & passed nonlinear layer
+        d10_c = self.dec10_nl(torch.cat((d10, self.shrinkage10(e10)), dim=1))
+        d9 = self.dec9(d10_c)
+        d9_c = self.dec9_nl(torch.cat((d9, self.shrinkage9(e9)), dim=1))
+        d8 = self.dec8(d9_c)
+        d8_c = self.dec8_nl(torch.cat((d8, self.shrinkage8(e8)), dim=1))
+        d7 = self.dec7(d8_c)
+        d7_c = self.dec7_nl(torch.cat((d7, self.shrinkage7(e7)), dim=1))
+        d6 = self.dec6(d7_c)
+        d6_c = self.dec6_nl(torch.cat((d6, self.shrinkage6(e6)), dim=1))
+        d5 = self.dec5(d6_c)
+        d5_c = self.dec5_nl(torch.cat((d5, self.shrinkage5(e5)), dim=1))
+        d4 = self.dec4(d5_c)
+        d4_c = self.dec4_nl(torch.cat((d4, self.shrinkage4(e4)), dim=1))
+        d3 = self.dec3(d4_c)
+        d3_c = self.dec3_nl(torch.cat((d3, self.shrinkage3(e3)), dim=1))
+        d2 = self.dec2(d3_c)
+        d2_c = self.dec2_nl(torch.cat((d2, self.shrinkage2(e2)), dim=1))
+        d1 = self.dec1(d2_c)
+        d1_c = self.dec1_nl(torch.cat((d1, self.shrinkage1(e1)), dim=1))
+        out = self.dec_tanh(self.dec_final(d1_c))
+        return out
 
 
 class Discriminator(nn.Module):
-    """
-    References from SEGAN https://arxiv.org/abs/1703.09452
-    """
+    """D"""
+
     def __init__(self):
-        super(Discriminator, self).__init__()
+        super().__init__()
+        # D gets a noisy signal and clear signal as input [B x 2 x 16384]
         negative_slope = 0.03
-        self.conv1 = nn.Conv1d(in_channels=2, out_channels=32, kernel_size=31, stride=2, padding=15)
+        self.conv1 = nn.Conv1d(in_channels=2, out_channels=32, kernel_size=31, stride=2, padding=15)  # [B x 32 x 8192]
         self.vbn1 = VirtualBatchNorm1d(32)
         self.lrelu1 = nn.LeakyReLU(negative_slope)
-        self.conv2 = nn.Conv1d(32, 64, 31, 2, 15)
+        self.conv2 = nn.Conv1d(32, 64, 31, 2, 15)  # [B x 64 x 4096]
         self.vbn2 = VirtualBatchNorm1d(64)
         self.lrelu2 = nn.LeakyReLU(negative_slope)
-        self.conv3 = nn.Conv1d(64, 64, 31, 2, 15)
+        self.conv3 = nn.Conv1d(64, 64, 31, 2, 15)  # [B x 64 x 2048]
         self.dropout1 = nn.Dropout()
         self.vbn3 = VirtualBatchNorm1d(64)
         self.lrelu3 = nn.LeakyReLU(negative_slope)
-        self.conv4 = nn.Conv1d(64, 128, 31, 2, 15)
+        self.conv4 = nn.Conv1d(64, 128, 31, 2, 15)  # [B x 128 x 1024]
         self.vbn4 = VirtualBatchNorm1d(128)
         self.lrelu4 = nn.LeakyReLU(negative_slope)
-        self.conv5 = nn.Conv1d(128, 128, 31, 2, 15)
+        self.conv5 = nn.Conv1d(128, 128, 31, 2, 15)  # [B x 128 x 512]
         self.vbn5 = VirtualBatchNorm1d(128)
         self.lrelu5 = nn.LeakyReLU(negative_slope)
-        self.conv6 = nn.Conv1d(128, 256, 31, 2, 15)
+        self.conv6 = nn.Conv1d(128, 256, 31, 2, 15)  # [B x 256 x 256]
         self.dropout2 = nn.Dropout()
         self.vbn6 = VirtualBatchNorm1d(256)
         self.lrelu6 = nn.LeakyReLU(negative_slope)
-        self.conv7 = nn.Conv1d(256, 256, 31, 2, 15)
+        self.conv7 = nn.Conv1d(256, 256, 31, 2, 15)  # [B x 256 x 128]
         self.vbn7 = VirtualBatchNorm1d(256)
         self.lrelu7 = nn.LeakyReLU(negative_slope)
-        self.conv8 = nn.Conv1d(256, 512, 31, 2, 15)
+        self.conv8 = nn.Conv1d(256, 512, 31, 2, 15)  # [B x 512 x 64]
         self.vbn8 = VirtualBatchNorm1d(512)
         self.lrelu8 = nn.LeakyReLU(negative_slope)
-        self.conv9 = nn.Conv1d(512, 512, 31, 2, 15)
+        self.conv9 = nn.Conv1d(512, 512, 31, 2, 15)  # [B x 512 x 32]
         self.dropout3 = nn.Dropout()
         self.vbn9 = VirtualBatchNorm1d(512)
         self.lrelu9 = nn.LeakyReLU(negative_slope)
-        self.conv10 = nn.Conv1d(512, 1024, 31, 2, 15)
+        self.conv10 = nn.Conv1d(512, 1024, 31, 2, 15)  # [B x 1024 x 16]
         self.vbn10 = VirtualBatchNorm1d(1024)
         self.lrelu10 = nn.LeakyReLU(negative_slope)
-        self.conv11 = nn.Conv1d(1024, 2048, 31, 2, 15)
+        self.conv11 = nn.Conv1d(1024, 2048, 31, 2, 15)  # [B x 2048 x 8]
         self.vbn11 = VirtualBatchNorm1d(2048)
         self.lrelu11 = nn.LeakyReLU(negative_slope)
-        self.conv_final = nn.Conv1d(2048, 1, kernel_size=1, stride=1)
+        # 1x1 size kernel for dimension and parameter reduction
+        self.conv_final = nn.Conv1d(2048, 1, kernel_size=1, stride=1)  # [B x 1 x 8]
         self.lrelu_final = nn.LeakyReLU(negative_slope)
-        self.fully_connected = nn.Linear(in_features=8, out_features=1)
-        self.dropout4 = nn.Dropout()
+        self.fully_connected = nn.Linear(in_features=8, out_features=1)  # [B x 1]
         self.sigmoid = nn.Sigmoid()
 
         # initialize weights
@@ -257,15 +323,16 @@ class Discriminator(nn.Module):
         """
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight)
+                nn.init.xavier_normal_(m.weight.data)
 
     def forward(self, x, ref_x):
         """
         Forward pass of discriminator.
         Args:
-            x: D gets a noisy signal and clear signal as input [B x 2 x 16384]
+            x: input batch (signal)
             ref_x: reference input batch for virtual batch norm
         """
+        # reference pass
         ref_x = self.conv1(ref_x)
         ref_x, mean1, meansq1 = self.vbn1(ref_x, None, None)
         ref_x = self.lrelu1(ref_x)
@@ -301,7 +368,9 @@ class Discriminator(nn.Module):
         ref_x = self.lrelu10(ref_x)
         ref_x = self.conv11(ref_x)
         ref_x, mean11, meansq11 = self.vbn11(ref_x, None, None)
+        # further pass no longer needed
 
+        # train pass
         x = self.conv1(x)
         x, _, _ = self.vbn1(x, mean1, meansq1)
         x = self.lrelu1(x)
@@ -340,34 +409,18 @@ class Discriminator(nn.Module):
         x = self.lrelu11(x)
         x = self.conv_final(x)
         x = self.lrelu_final(x)
+        # reduce down to a scalar value
         x = torch.squeeze(x)
         x = self.fully_connected(x)
-        x = self.dropout4(x)
         return self.sigmoid(x)
 
 
-class Adam(optim.Adam):
-    def __init__(self, params, cfg):
-        super(Adam, self).__init__(params, cfg['learning_rate'], cfg['betas'], cfg['eps'], cfg['weight_decay'], cfg['amsgrad'])
-
-    def cuda(self):
-        for state in self.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.cuda()
-
-    def cuda_gpu(self, gpu):
-        for state in self.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.cuda(gpu)
-
-
 if __name__ == '__main__':
-    net = Generator()
-    inputs = torch.rand([1, 1, 16384], dtype=torch.float32)
-
-    out = net(inputs)
-    pass
-
-
+    net = Generator(kernel_size=4, Shrink=False)
+    print(sum(param.numel() for param in net.parameters()))
+    net = Generator(kernel_size=8, Shrink=False)
+    print(sum(param.numel() for param in net.parameters()))
+    net = Generator(kernel_size=16, Shrink=False)
+    print(sum(param.numel() for param in net.parameters()))
+    net = Generator(kernel_size=32, Shrink=False)
+    print(sum(param.numel() for param in net.parameters()))

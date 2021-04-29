@@ -1,0 +1,43 @@
+data:
+  corpus: 'DEMAND'
+  root_path: '/media/nitin525/3A90C18290C1455B/database/'
+  data_type: 'test'
+  sample_rate: 16000
+  window_size: 16384
+  window_stride: 0.5
+  window: 'hamming'
+
+
+hparas:
+  batch_size: 64
+  epochs: 10000
+  lr: 0.0001
+  weight_decay: 0.00001
+  train_continue: False
+  num_workers: 6
+  checkpoint: '95'
+  save_path: '/media/ubuntu/Samsung_T5/models'
+  log_path: 'logs/'
+  cuda_device: 3
+  spem_loss: 1
+  mode: 'segan'
+
+test:
+  model_path: '/media/nitin525/3A90C18290C1455B/models/segan+Shrink+specloss'
+  file_path: '/media/nitin525/3A90C18290C1455B/database/DEMAND/test/noise'
+  result_save_path: '/media/nitin525/3A90C18290C1455B/database/DEMAND/test/enhanced/DEMAND-'
+  DistanceFuse: False
+
+model:
+  kernel_size: 16
+  Shrink: True
+
+loss:
+  loss_mode: 'MRSTFT'
+  fft_sizes: [ 1024, 2048, 512 ]
+  hop_sizes: [ 120, 240, 50 ]
+  win_lengths: [ 600, 1200, 240 ]
+  window: "hann_window"
+  factor_sc: 0.5
+  factor_mag: 0.5
+
