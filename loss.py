@@ -76,7 +76,8 @@ class STFTLoss(nn.Module):
         self.register_buffer("window", getattr(torch, window)(win_length))
         self.spectral_convergenge_loss = SpectralConvergengeLoss()
         self.log_stft_magnitude_loss = LogSTFTMagnitudeLoss()
-
+        self.factor = fft_size / 2048
+        
     def forward(self, x, y):
         """Calculate forward propagation.
         Args:
@@ -91,7 +92,7 @@ class STFTLoss(nn.Module):
         sc_loss = self.spectral_convergenge_loss(x_mag, y_mag)
         mag_loss = self.log_stft_magnitude_loss(x_mag, y_mag)
 
-        return sc_loss, mag_loss
+        return sc_loss*self.factor, mag_loss*self.factor
 
 
 class MultiResolutionSTFTLoss(nn.Module):
